@@ -462,6 +462,8 @@ Any Node 20 host works — build with `npm run build`, run with `npm run start`.
 
 ## License
 
-MIT. See [`LICENSE`](./LICENSE) (add one before going public if you care about trademarks/claims).
+MIT — see [`LICENSE`](./LICENSE). The license file includes an additional disclaimer about the legal status of real-money case-opening and the Pokémon trademarks.
+
+Contributions welcome — read [`CONTRIBUTING.md`](./CONTRIBUTING.md) first.
 
 > Not affiliated with Nintendo, The Pokémon Company, or Wizards of the Coast. "Pokémon" is a trademark of its respective owners; card images are used for illustration only.
