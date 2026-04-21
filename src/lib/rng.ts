@@ -47,24 +47,44 @@ export type Roll = {
 
 export function computeRoll(serverSeed: string, clientSeed: string, nonce: number): Roll {
   const hash = createHmac("sha256", serverSeed).update(`${clientSeed}:${nonce}`).digest("hex");
-  // First 8 bytes -> 64-bit uint -> divide by 2^64 for [0, 1)
+  // Convert the first 8 bytes of the HMAC into a uniform float in [0, 1).
+  //
+  // A JS Number is a 64-bit double with a 53-bit mantissa. We take the top
+  // 53 bits of the 64-bit hash value (by shifting off the low 11 bits) and
+  // divide by 2^53 — both the numerator and denominator are exactly
+  // representable, so there's no rounding bias. 2^53 cannot be reached
+  // (max value is 2^53 - 1), guaranteeing the result is strictly < 1.0.
   const first16 = hash.slice(0, 16);
   const big = BigInt("0x" + first16);
-  const value = Number(big) / Number(1n << 64n);
+  const top53 = big >> 11n;
+  const value = Number(top53) / 2 ** 53;
   return { hash, value };
 }
 
-/** Verify a revealed server seed produced the given roll — client-side safe. */
+/**
+ * Verify a revealed server seed produced the given roll — client-side safe.
+ *
+ * Pass `expectedRollValue` (when known) to check that the published numeric
+ * value also matches what this library would compute. This guards against a
+ * server that publishes a correct hash but tampered-with value.
+ */
 export function verifyRoll(
   serverSeedPlain: string,
   serverSeedHash: string,
   clientSeed: string,
   nonce: number,
   expectedRollHash: string,
+  expectedRollValue?: number,
 ): boolean {
   if (sha256Hex(serverSeedPlain) !== serverSeedHash) return false;
-  const { hash } = computeRoll(serverSeedPlain, clientSeed, nonce);
-  return hash === expectedRollHash;
+  const { hash, value } = computeRoll(serverSeedPlain, clientSeed, nonce);
+  if (hash !== expectedRollHash) return false;
+  if (expectedRollValue !== undefined) {
+    // Allow a tiny epsilon for platforms that serialized the float with
+    // slightly different precision (e.g. JSON vs numeric round-trip).
+    if (Math.abs(value - expectedRollValue) > 1e-12) return false;
+  }
+  return true;
 }
 
 /**

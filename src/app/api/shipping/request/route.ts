@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { getSessionUser } from "@/lib/auth";
+import { guardPlayer } from "@/lib/guard";
 import { createSupabaseAdmin } from "@/lib/supabase/server";
 
 export const runtime = "nodejs";
@@ -29,8 +29,9 @@ function estimateShipping(totalValueCents: number): number {
 }
 
 export async function POST(req: Request) {
-  const user = await getSessionUser();
-  if (!user) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  const gate = await guardPlayer();
+  if (!gate.ok) return gate.response;
+  const { user } = gate;
 
   const parsed = bodySchema.safeParse(await req.json().catch(() => ({})));
   if (!parsed.success) return NextResponse.json({ error: "bad_request" }, { status: 400 });
@@ -38,24 +39,28 @@ export async function POST(req: Request) {
 
   const admin = createSupabaseAdmin();
 
-  // Validate units belong to user + are held.
+  // Pre-fetch units JUST to estimate the fee. The RPC locks and revalidates
+  // them inside the transaction so this is safe to race against.
   const { data: units } = await admin
     .from("card_units")
     .select("id, owned_by_user, state, card:cards(market_value_cents)")
     .in("id", unit_ids);
 
-  const validUnits = (units as Array<{
-    id: string;
+  const eligibleValue = ((units as Array<{
     owned_by_user: string;
     state: string;
     card: { market_value_cents: number };
-  }> | null)?.filter((u) => u.owned_by_user === user.id && u.state === "held") ?? [];
+  }> | null) ?? [])
+    .filter((u) => u.owned_by_user === user.id && u.state === "held")
+    .reduce((acc, u) => acc + u.card.market_value_cents, 0);
 
-  if (validUnits.length === 0) {
+  if (eligibleValue === 0) {
     return NextResponse.json({ error: "no_valid_cards" }, { status: 400 });
   }
 
-  // Resolve address.
+  const shippingFee = estimateShipping(eligibleValue);
+
+  // Resolve destination address (create if the client supplied a new one).
   let addressId = address_id;
   if (!addressId) {
     if (!new_address) return NextResponse.json({ error: "address_required" }, { status: 400 });
@@ -68,62 +73,31 @@ export async function POST(req: Request) {
   }
   if (!addressId) return NextResponse.json({ error: "address_create_failed" }, { status: 500 });
 
-  const totalValue = validUnits.reduce((acc, u) => acc + u.card.market_value_cents, 0);
-  const shippingFee = estimateShipping(totalValue);
+  // Single atomic RPC: validates ownership, debits wallet, creates shipment,
+  // creates shipment_items, flips card_units, writes ledger row.
+  const { data: rpcData, error: rpcErr } = await admin.rpc("request_shipment", {
+    p_user_id: user.id,
+    p_unit_ids: unit_ids,
+    p_address_id: addressId,
+    p_shipping_fee_cents: shippingFee,
+  });
 
-  // Debit wallet for shipping fee (skip if zero).
-  if (shippingFee > 0) {
-    const { data: wallet } = await admin
-      .from("wallets")
-      .select("balance_cents")
-      .eq("user_id", user.id)
-      .maybeSingle();
-    if (!wallet || Number(wallet.balance_cents) < shippingFee) {
-      return NextResponse.json({ error: "insufficient_funds_for_shipping" }, { status: 402 });
-    }
-    // We don't have a dedicated RPC for shipping fee debits — use a direct update + ledger row.
-    // In production this should also be an atomic RPC.
-    await admin
-      .from("wallets")
-      .update({ balance_cents: Number(wallet.balance_cents) - shippingFee })
-      .eq("user_id", user.id);
-    await admin.from("transactions").insert({
-      user_id: user.id,
-      kind: "shipping_fee",
-      status: "succeeded",
-      amount_cents: -shippingFee,
-      balance_after_cents: Number(wallet.balance_cents) - shippingFee,
-      reference_type: "shipment_pending",
-      reference_id: addressId,
-      memo: "Shipping fee",
-    });
+  if (rpcErr) {
+    const msg = rpcErr.message || "shipment_failed";
+    const status = /insufficient_funds/.test(msg)
+      ? 402
+      : /no_valid_cards|invalid_address/.test(msg)
+        ? 400
+        : 500;
+    return NextResponse.json({ error: msg }, { status });
   }
 
-  // Create shipment + mark units as ship_requested.
-  const { data: shipment } = await admin
-    .from("shipments")
-    .insert({
-      user_id: user.id,
-      address_id: addressId,
-      status: "requested",
-      shipping_fee_cents: shippingFee,
-      insured_value_cents: totalValue,
-    })
-    .select("id")
-    .single();
-
-  if (shipment) {
-    await admin.from("shipment_items").insert(
-      validUnits.map((u) => ({ shipment_id: shipment.id, card_unit_id: u.id })),
-    );
-    await admin
-      .from("card_units")
-      .update({ state: "ship_requested", updated_at: new Date().toISOString() })
-      .in(
-        "id",
-        validUnits.map((u) => u.id),
-      );
-  }
-
-  return NextResponse.json({ ok: true, shipment_id: shipment?.id });
+  const result = Array.isArray(rpcData) ? rpcData[0] : rpcData;
+  return NextResponse.json({
+    ok: true,
+    shipment_id: result?.shipment_id,
+    shipping_fee_cents: shippingFee,
+    insured_value_cents: result?.insured_value_cents,
+    item_count: result?.item_count,
+  });
 }

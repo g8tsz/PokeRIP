@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { stripe } from "@/lib/stripe";
-import { getSessionUser } from "@/lib/auth";
+import { guardPlayer } from "@/lib/guard";
 import { createSupabaseAdmin } from "@/lib/supabase/server";
 import { env } from "@/lib/env";
 
@@ -22,8 +22,9 @@ const bodySchema = z.object({
  *      (In test mode, Stripe will auto-pay via test bank tokens.)
  */
 export async function POST(req: Request) {
-  const user = await getSessionUser();
-  if (!user) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  const gate = await guardPlayer();
+  if (!gate.ok) return gate.response;
+  const { user } = gate;
 
   const parsed = bodySchema.safeParse(await req.json().catch(() => ({})));
   if (!parsed.success) return NextResponse.json({ error: "bad_amount" }, { status: 400 });
